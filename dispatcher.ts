@@ -35,6 +35,16 @@ export type AgentIndex = Map<string, AgentDef>;
 
 const CHILD_RUNNER_PATH = fileURLToPath(new URL("./child-runner.js", import.meta.url));
 
+function debugEnabled(): boolean {
+	const v = process.env.PI_SUBAGENT_DEBUG?.trim().toLowerCase();
+	return v === "1" || v === "true" || v === "yes";
+}
+
+function debugLog(...args: unknown[]): void {
+	if (!debugEnabled()) return;
+	console.error("[dispatcher]", ...args);
+}
+
 // ── Output resolution ─────────────────────────────────────────────────────────
 
 function resolveOutputPath(
@@ -96,7 +106,7 @@ function buildTask(request: DispatchRequest): string {
 
 function buildPiCommand(options: {
 	runId: string;
-	model: string;
+	model?: string;
 	tools: string;
 	systemPrompt: string;
 	piSessionFile: string;
@@ -120,7 +130,7 @@ function buildPiCommand(options: {
 			"--mode", "json",
 			"-p",
 			"--no-extensions",
-			"--model", model,
+			...(model ? ["--model", model] : []),
 			"--tools", tools,
 			"--thinking", "off",
 			"--append-system-prompt", systemPrompt,
@@ -223,11 +233,12 @@ export async function dispatchAgent(
 	const run = makeRun(runId, def, request, resolvedOutputPath);
 
 	// 9. Build pi command
-	const model = request.model ?? process.env.PI_MODEL ?? "openrouter/google/gemini-2.5-flash-preview";
+	const model = request.model ?? def.model;
+	const tools = def.tools?.trim() || "read,grep,find,ls";
 	const command = buildPiCommand({
 		runId,
 		model,
-		tools: def.tools,
+		tools,
 		systemPrompt: def.systemPrompt,
 		piSessionFile,
 		shouldContinue,
@@ -235,6 +246,19 @@ export async function dispatchAgent(
 		task,
 		extraArgs: request.extraArgs ?? [],
 		cwd,
+	});
+	debugLog("launch config", {
+		runId,
+		agent: def.name,
+		cwd,
+		sessionDir,
+		ipcPath,
+		piSessionFile,
+		shouldContinue,
+		model: model ?? "(pi default)",
+		tools,
+		childRunner: CHILD_RUNNER_PATH,
+		commandPreview: command.slice(0, 500),
 	});
 
 	// Elapsed timer
@@ -251,6 +275,7 @@ export async function dispatchAgent(
 	let terminalErr: string | undefined;
 
 	channel.onMessage((msg: IpcMessage) => {
+		debugLog("ipc message", { runId, type: msg.type });
 		switch (msg.type) {
 			case "text_delta":
 				textChunks.push(msg.delta);
@@ -304,12 +329,14 @@ export async function dispatchAgent(
 		cwd,
 		env: { ...process.env },
 	});
+	debugLog("terminal launched", { runId, pid: launchResult.pid });
 	run.pid = launchResult.pid;
 	onUpdate?.(snapshot(run));
 
 	// 12. Wait for child to open FIFO, then wait for completion
 	return new Promise<AgentRunResult>((resolve, reject) => {
 		channel.waitForOpen().catch((err: Error) => {
+			debugLog("waitForOpen failed", { runId, error: err.message });
 			clearInterval(elapsedTimer);
 			run.status = "failed";
 			run.endedAt = Date.now();
@@ -324,6 +351,15 @@ export async function dispatchAgent(
 
 			const succeeded = !err && !terminalErr && sawDone && doneExitCode === 0;
 			run.status = succeeded ? "complete" : "failed";
+			debugLog("channel closed", {
+				runId,
+				error: err?.message,
+				terminalErr,
+				sawDone,
+				doneExitCode,
+				succeeded,
+				outputChars: run.output.length,
+			});
 
 			// Record session metadata
 			try {

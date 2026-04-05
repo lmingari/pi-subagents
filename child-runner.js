@@ -4,7 +4,19 @@ const fs = require("fs");
 const { spawn } = require("child_process");
 const readline = require("readline");
 
+const DEBUG = ["1", "true", "yes"].includes(String(process.env.PI_SUBAGENT_DEBUG || "").toLowerCase());
+const DEBUG_LOG_FILE = process.env.PI_SUBAGENT_LOG || "/tmp/pi-subagent.log";
+
+function log(message, extra) {
+	if (!DEBUG) return;
+	const ts = new Date().toISOString();
+	const line = `[${ts}] [child-runner] ${message}${extra ? " " + JSON.stringify(extra) : ""}\n`;
+	try { fs.appendFileSync(DEBUG_LOG_FILE, line, "utf-8"); } catch {}
+	try { process.stderr.write(line); } catch {}
+}
+
 function fail(message) {
+	log("fatal", { message });
 	try {
 		process.stderr.write(`[child-runner] ${message}\n`);
 	} catch {}
@@ -30,10 +42,18 @@ if (!runId || !fifoPath || !cwd || !piArgs) {
 	fail("Payload missing required fields (runId, fifoPath, cwd, piArgs[])");
 }
 
+log("payload received", {
+	runId,
+	fifoPath,
+	cwd,
+	piArgsCount: piArgs.length,
+});
+
 let fifoFd;
 try {
 	// Blocks until parent opens the read end.
 	fifoFd = fs.openSync(fifoPath, "w");
+	log("fifo opened", { fifoPath });
 } catch (err) {
 	fail(`Failed to open FIFO at ${fifoPath}: ${err.message}`);
 }
@@ -162,9 +182,11 @@ const child = spawn("pi", piArgs, {
 	env: { ...process.env, PI_IPC_FIFO: fifoPath },
 	stdio: ["ignore", "pipe", "pipe"],
 });
+log("pi spawn attempted", { command: "pi", args: piArgs, cwd });
 
 const out = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
 out.on("line", (line) => {
+	log("stdout line", { bytes: line.length });
 	const trimmed = line.trim();
 	if (!trimmed) return;
 
@@ -195,15 +217,18 @@ out.on("line", (line) => {
 const err = readline.createInterface({ input: child.stderr, crlfDelay: Infinity });
 err.on("line", (line) => {
 	if (!line.trim()) return;
+	log("stderr line", { line });
 	stderrTail = (stderrTail + line + "\n").slice(-4000);
 });
 
 child.on("error", (spawnErr) => {
+	log("pi spawn error", { message: spawnErr.message });
 	finish(1, `Failed to start pi: ${spawnErr.message}`);
 });
 
 child.on("close", (code) => {
 	const exitCode = typeof code === "number" ? code : 1;
+	log("pi process closed", { exitCode });
 	const errMsg = exitCode === 0 ? undefined : `pi exited with code ${exitCode}${stderrTail ? `: ${stderrTail.trim()}` : ""}`;
 	finish(exitCode, errMsg);
 });

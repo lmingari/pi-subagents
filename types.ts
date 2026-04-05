@@ -30,6 +30,7 @@ export interface TokenUsage {
  *   name: code-reviewer
  *   description: Reviews code for bugs and style issues
  *   tools: read,grep,find,ls
+ *   model: openrouter/google/gemini-2.5-flash-preview
  *   output: outputs/code-reviewer.md   # relative to cwd, optional
  *   ---
  *   <system prompt body>
@@ -45,6 +46,8 @@ export interface AgentDef {
 	description: string;
 	/** Comma-separated pi tool names this agent is allowed to use */
 	tools: string;
+	/** Optional default model for this agent (overridden by DispatchRequest.model) */
+	model?: string;
 	/** Full system prompt body (everything after the frontmatter block) */
 	systemPrompt: string;
 	/** Absolute path to the source .md file */

@@ -6,6 +6,7 @@
  *   name        required — unique agent identifier
  *   description optional — one-line summary
  *   tools       optional — comma-separated pi tool names (default: "read,grep,find,ls")
+ *   model       optional — default model id for this agent
  *   output      optional — default output file path, relative to cwd
  *
  * Search order (first match for a given name wins):
@@ -27,6 +28,26 @@ const AGENT_DIRS = [
 ] as const;
 
 const DEFAULT_TOOLS = "read,grep,find,ls";
+
+function normalizeFrontmatterValue(value: string): string {
+	const trimmed = value.trim();
+	const unquoted =
+		(trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+		(trimmed.startsWith("'") && trimmed.endsWith("'"))
+			? trimmed.slice(1, -1)
+			: trimmed;
+	return unquoted.trim();
+}
+
+function normalizeTools(value: string | undefined): string {
+	if (!value) return DEFAULT_TOOLS;
+	const normalized = normalizeFrontmatterValue(value)
+		.split(",")
+		.map(t => t.trim())
+		.filter(Boolean)
+		.join(",");
+	return normalized || DEFAULT_TOOLS;
+}
 
 // ── Frontmatter parser ────────────────────────────────────────────────────────
 
@@ -56,7 +77,7 @@ export function parseAgentFile(filePath: string): AgentDef | null {
 		if (colonIdx < 1) continue;
 		const key = line.slice(0, colonIdx).trim();
 		const value = line.slice(colonIdx + 1).trim();
-		if (key) frontmatter[key] = value;
+		if (key) frontmatter[key] = normalizeFrontmatterValue(value);
 	}
 
 	if (!frontmatter.name) return null;
@@ -64,10 +85,11 @@ export function parseAgentFile(filePath: string): AgentDef | null {
 	return {
 		name: frontmatter.name,
 		description: frontmatter.description ?? "",
-		tools: frontmatter.tools ?? DEFAULT_TOOLS,
+		tools: normalizeTools(frontmatter.tools),
+		model: frontmatter.model || undefined,
 		systemPrompt: body.trim(),
 		file: filePath,
-		outputFile: frontmatter.output ?? undefined,
+		outputFile: frontmatter.output || undefined,
 	};
 }
 

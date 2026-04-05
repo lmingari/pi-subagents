@@ -21,7 +21,7 @@ import { join } from "path";
 import { scanAgentDirs, buildAgentIndex } from "../agent-loader.ts";
 import { dispatchAgent } from "../dispatcher.ts";
 import { applyExtensionDefaults } from "../themeMap.ts";
-import type { AgentRun, AgentGroup, DispatchRequest } from "../types.ts";
+import type { AgentRun, AgentGroup, DispatchRequest, AgentDef } from "../types.ts";
 
 // ── Group definition ──────────────────────────────────────────────────────────
 
@@ -107,11 +107,66 @@ export default function (pi: ExtensionAPI) {
 
 	// ── Shared dispatch helper ────────────────────────────────────────────────
 
+	function splitTools(tools: string): string[] {
+		return tools.split(",").map(t => t.trim()).filter(Boolean);
+	}
+
+	function formatLaunchSummary(def: AgentDef, request: DispatchRequest): string {
+		const model = request.model ?? def.model ?? "(pi default)";
+		const provider = typeof model === "string" && model.includes("/")
+			? model.split("/")[0]
+			: "(default provider)";
+		const tools = splitTools(def.tools || "");
+		const description = def.description?.trim() || "(no description)";
+		const output = typeof request.output === "string"
+			? request.output
+			: request.output === true
+				? (def.outputFile ?? "<sessionDir>/<agent>.out.md")
+				: "disabled";
+		return [
+			`Launching ${def.name}`,
+			`provider/model: ${provider} / ${model}`,
+			`tools: ${tools.length ? tools.join(", ") : "(none)"}`,
+			`context: ${request.context}`,
+			`output: ${output}`,
+			`description: ${description}`,
+		].join("\n");
+	}
+
+	function validateAgentDef(def: AgentDef): string[] {
+		const warnings: string[] = [];
+		const tools = splitTools(def.tools || "");
+		if (!tools.length) {
+			warnings.push(`${def.name}: no tools configured; default tools will be used`);
+		}
+
+		if (!def.systemPrompt?.trim()) {
+			warnings.push(`${def.name}: empty system prompt`);
+		}
+
+		if (!def.description?.trim()) {
+			warnings.push(`${def.name}: missing description`);
+		}
+
+		const model = def.model?.trim();
+		if (model?.startsWith("openrouter/") && !process.env.OPENROUTER_API_KEY) {
+			warnings.push(`${def.name}: uses openrouter model but OPENROUTER_API_KEY is not set (login may still work)`);
+		}
+
+		return warnings;
+	}
+
 	async function dispatch(
 		agentName: string,
 		task: string,
 		inputs: string[] = [],
 	): Promise<void> {
+		const def = agentIndex.get(agentName.toLowerCase());
+		if (!def) {
+			widgetCtx?.ui.notify(`Agent not found: ${agentName}`, "error");
+			return;
+		}
+
 		const request: DispatchRequest = {
 			agent: agentName,
 			task,
@@ -124,7 +179,7 @@ export default function (pi: ExtensionAPI) {
 			cwd,
 		};
 
-		widgetCtx?.ui.notify(`Dispatching ${agentName}…`, "info");
+		widgetCtx?.ui.notify(formatLaunchSummary(def, request), "info");
 
 		try {
 			// dispatchAgent streams updates via onUpdate — we use them only to
@@ -232,6 +287,28 @@ export default function (pi: ExtensionAPI) {
 				`Add them to .pi/agents/`,
 				"warning",
 			);
+		}
+
+		// Startup validation + summary
+		const startupWarnings: string[] = [];
+		const startupSummary: string[] = [];
+		for (const member of GROUP.members) {
+			const def = agentIndex.get(member.toLowerCase());
+			if (!def) continue;
+			startupWarnings.push(...validateAgentDef(def));
+			const model = def.model ?? "(pi default)";
+			const provider = model.includes("/") ? model.split("/")[0] : "(default provider)";
+			const tools = splitTools(def.tools || "");
+			startupSummary.push(
+				`${def.name} → ${provider}/${model} | tools: ${tools.length ? tools.join(",") : "(default)"}`
+			);
+		}
+
+		if (startupWarnings.length) {
+			ctx.ui.notify(`Startup validation warnings:\n${startupWarnings.join("\n")}`, "warning");
+		}
+		if (startupSummary.length) {
+			ctx.ui.notify(`Agent summary:\n${startupSummary.join("\n")}`, "info");
 		}
 
 		// Master has no tools — it only dispatches via commands
