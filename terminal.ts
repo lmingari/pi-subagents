@@ -86,8 +86,31 @@ export async function launchInTerminal(
 		);
 	}
 
+	const holdOpen = isTruthy(process.env.PI_SUBAGENT_HOLD_OPEN);
+	const effectiveOptions = holdOpen
+		? { ...options, command: wrapCommandKeepingWindowOpen(options.command) }
+		: options;
+
 	const launcher = getLauncher(app) ?? genericLauncher(app);
-	return launcher.launch(options);
+	return launcher.launch(effectiveOptions);
+}
+
+function isTruthy(v: string | undefined): boolean {
+	if (!v) return false;
+	const n = v.trim().toLowerCase();
+	return n === "1" || n === "true" || n === "yes" || n === "on";
+}
+
+function wrapCommandKeepingWindowOpen(command: string): string {
+	return [
+		`(${command})`,
+		"__pi_exit=$?",
+		"echo",
+		"echo '[pi-subagent] process finished.'",
+		"echo '[pi-subagent] Press Enter to close this terminal.'",
+		"read -r _",
+		"exit $__pi_exit",
+	].join("; ");
 }
 
 // ── Hidden launcher (test / CI) ───────────────────────────────────────────────

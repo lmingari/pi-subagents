@@ -127,17 +127,14 @@ function buildPiCommand(options: {
 		fifoPath,
 		cwd,
 		piArgs: [
-			"--mode", "json",
-			"-p",
 			"--no-extensions",
 			...(model ? ["--model", model] : []),
 			"--tools", tools,
 			"--thinking", "off",
-			"--append-system-prompt", systemPrompt,
+			"--append-system-prompt", `${systemPrompt}\n\nInitial task from master: ${task}`,
 			"--session", piSessionFile,
 			...(shouldContinue ? ["-c"] : []),
 			...extraArgs,
-			task,
 		],
 	};
 
@@ -309,11 +306,15 @@ export async function dispatchAgent(
 					run.output = msg.output;
 					run.lastWork = lastNonEmptyLine(run.output);
 				}
+				// Do not rely solely on FIFO EOF; proactively close when terminal
+				// reports completion so dispatcher can finalize deterministically.
+				void channel.close();
 				break;
 
 			case "agent_error":
 				terminalErr = msg.message;
 				run.status = "failed";
+				void channel.close();
 				break;
 		}
 

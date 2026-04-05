@@ -165,19 +165,43 @@ async function createFifoChannel(transport: FifoTransport): Promise<IpcChannel> 
 		if (startPromise) return startPromise;
 
 		startPromise = (async () => {
-			fd = await open(path, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+			// Open FIFO read-write on parent side to avoid premature EOF before
+			// the child opens its write-end. Keep this in blocking mode to avoid
+			// transient EAGAIN read errors from non-blocking stream reads.
+			fd = await open(path, fsConstants.O_RDWR);
+
 			const stream = createReadStream("", { fd: fd.fd, autoClose: false });
 			readlineInterface = createInterface({ input: stream, crlfDelay: Infinity });
 
 			readlineInterface.on("line", emitMessage);
 
 			readlineInterface.on("close", () => {
+				if (!opened) {
+					rejectOpenIfPending(new Error(
+						`IPC FIFO closed before child connected. Path: ${path}`
+					));
+				}
 				cleanup()
 					.then(() => emitClose())
 					.catch((err) => emitClose(err as Error));
 			});
 
-			stream.on("error", (err) => {
+			readlineInterface.on("error", (err: Error) => {
+				if ((err as any).code === "EAGAIN") {
+					// Non-fatal transient read condition on some platforms.
+					return;
+				}
+				rejectOpenIfPending(err);
+				cleanup()
+					.then(() => emitClose(err))
+					.catch((cleanupErr) => emitClose(cleanupErr as Error));
+			});
+
+			stream.on("error", (err: any) => {
+				if (err?.code === "EAGAIN") {
+					// Non-fatal transient read condition on some platforms.
+					return;
+				}
 				rejectOpenIfPending(err as Error);
 				cleanup()
 					.then(() => emitClose(err as Error))

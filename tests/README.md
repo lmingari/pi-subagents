@@ -6,7 +6,34 @@ This project uses three test levels:
 - `tests/integration/` — multi-module behavior (dispatcher + IPC + child runner)
 - `tests/smoke/` — manual checks for GUI terminal launch behavior
 
-## Current manual smoke test
+## Fixtures
+
+Agent markdown fixtures live under `tests/fixtures/agents/`.
+(Previously they were under a top-level `assets/` folder; moved to keep test data co-located with tests.)
+
+## Automated unit tests
+
+Implemented:
+
+- `tests/unit/agent-loader.test.ts`
+  - frontmatter parsing
+  - empty tools fallback
+  - provider/modelID parsing (`provider/modelID` convention)
+  - directory scan precedence
+
+Run with Node + tsx loader:
+
+```bash
+node --import tsx --test tests/unit/agent-loader.test.ts
+```
+
+Or without installing globally:
+
+```bash
+npx -y tsx --test tests/unit/agent-loader.test.ts
+```
+
+## Manual smoke test
 
 ### Terminal launcher smoke test
 

@@ -23,6 +23,18 @@ function fail(message) {
 	process.exit(1);
 }
 
+process.on("uncaughtException", (err) => {
+	log("uncaughtException", { message: err?.message, stack: err?.stack });
+	finish(1, `child-runner uncaughtException: ${err?.message || String(err)}`);
+	process.exit(1);
+});
+
+process.on("unhandledRejection", (reason) => {
+	log("unhandledRejection", { reason: String(reason) });
+	finish(1, `child-runner unhandledRejection: ${String(reason)}`);
+	process.exit(1);
+});
+
 const encoded = process.argv[2];
 if (!encoded) fail("Missing encoded payload argument");
 
@@ -59,11 +71,15 @@ try {
 }
 
 function send(msg) {
-	if (!fifoFd) return;
+	if (!fifoFd) {
+		log("send skipped (fifo closed)", { type: msg?.type });
+		return;
+	}
 	try {
 		fs.writeSync(fifoFd, JSON.stringify(msg) + "\n", null, "utf-8");
-	} catch {
-		// Parent likely closed the FIFO.
+		log("sent", { type: msg?.type });
+	} catch (err) {
+		log("send failed", { type: msg?.type, message: err?.message });
 	}
 }
 
@@ -156,21 +172,21 @@ function maybeSendToolStart(event) {
 	send({ type: "tool_start", runId, toolName: String(toolName) });
 }
 
-let output = "";
 let finalUsage = { inputTokens: 0, outputTokens: 0 };
-let stderrTail = "";
 let finished = false;
 
 function finish(exitCode, errMessage) {
 	if (finished) return;
 	finished = true;
+	log("finish", { exitCode, hasError: Boolean(errMessage) });
 
 	if (errMessage) {
 		send({ type: "agent_error", runId, message: errMessage });
 	}
 
+	// Interactive mode does not parse structured output/tokens from pi.
 	send({ type: "token_usage", runId, usage: finalUsage });
-	send({ type: "agent_done", runId, exitCode, output, usage: finalUsage });
+	send({ type: "agent_done", runId, exitCode, output: "", usage: finalUsage });
 	closeFifo();
 }
 
@@ -180,46 +196,9 @@ send({ type: "context_update", runId, usedTokens: 0, contextWindow: 1 });
 const child = spawn("pi", piArgs, {
 	cwd,
 	env: { ...process.env, PI_IPC_FIFO: fifoPath },
-	stdio: ["ignore", "pipe", "pipe"],
+	stdio: "inherit",
 });
-log("pi spawn attempted", { command: "pi", args: piArgs, cwd });
-
-const out = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
-out.on("line", (line) => {
-	log("stdout line", { bytes: line.length });
-	const trimmed = line.trim();
-	if (!trimmed) return;
-
-	let event;
-	try {
-		event = JSON.parse(trimmed);
-	} catch {
-		output += line + "\n";
-		send({ type: "text_delta", runId, delta: line + "\n" });
-		return;
-	}
-
-	maybeSendToolStart(event);
-
-	const usage = extractUsage(event);
-	if (usage) {
-		finalUsage = usage;
-		send({ type: "token_usage", runId, usage: finalUsage });
-	}
-
-	const text = extractText(event);
-	if (text) {
-		output += text;
-		send({ type: "text_delta", runId, delta: text });
-	}
-});
-
-const err = readline.createInterface({ input: child.stderr, crlfDelay: Infinity });
-err.on("line", (line) => {
-	if (!line.trim()) return;
-	log("stderr line", { line });
-	stderrTail = (stderrTail + line + "\n").slice(-4000);
-});
+log("pi spawn attempted", { command: "pi", args: piArgs, cwd, mode: "interactive" });
 
 child.on("error", (spawnErr) => {
 	log("pi spawn error", { message: spawnErr.message });
@@ -229,6 +208,6 @@ child.on("error", (spawnErr) => {
 child.on("close", (code) => {
 	const exitCode = typeof code === "number" ? code : 1;
 	log("pi process closed", { exitCode });
-	const errMsg = exitCode === 0 ? undefined : `pi exited with code ${exitCode}${stderrTail ? `: ${stderrTail.trim()}` : ""}`;
+	const errMsg = exitCode === 0 ? undefined : `pi exited with code ${exitCode}`;
 	finish(exitCode, errMsg);
 });
