@@ -15,6 +15,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { resolve, join, dirname } from "path";
+import { fileURLToPath } from "url";
 import { randomUUID } from "crypto";
 import type {
 	DispatchRequest,
@@ -28,9 +29,11 @@ import type {
 import { createChannel, fifoPath } from "./ipc.ts";
 import { launchInTerminal } from "./terminal.ts";
 import { resolveSession, recordRun } from "./session.ts";
-import { requireAgent, type AgentIndex } from "./agent-loader.ts";
+import { requireAgent } from "./agent-loader.ts";
 
 export type AgentIndex = Map<string, AgentDef>;
+
+const CHILD_RUNNER_PATH = fileURLToPath(new URL("./child-runner.js", import.meta.url));
 
 // ── Output resolution ─────────────────────────────────────────────────────────
 
@@ -92,6 +95,7 @@ function buildTask(request: DispatchRequest): string {
 // ── CLI builder ───────────────────────────────────────────────────────────────
 
 function buildPiCommand(options: {
+	runId: string;
 	model: string;
 	tools: string;
 	systemPrompt: string;
@@ -100,36 +104,37 @@ function buildPiCommand(options: {
 	fifoPath: string;
 	task: string;
 	extraArgs: string[];
+	cwd: string;
 }): string {
 	const {
+		runId,
 		model, tools, systemPrompt, piSessionFile,
-		shouldContinue, fifoPath, task, extraArgs,
+		shouldContinue, fifoPath, task, extraArgs, cwd,
 	} = options;
 
-	// Escape single quotes in task and system prompt for shell embedding
+	const payload = {
+		runId,
+		fifoPath,
+		cwd,
+		piArgs: [
+			"--mode", "json",
+			"-p",
+			"--no-extensions",
+			"--model", model,
+			"--tools", tools,
+			"--thinking", "off",
+			"--append-system-prompt", systemPrompt,
+			"--session", piSessionFile,
+			...(shouldContinue ? ["-c"] : []),
+			...extraArgs,
+			task,
+		],
+	};
+
+	const encoded = Buffer.from(JSON.stringify(payload), "utf-8").toString("base64");
 	const escapeShell = (s: string) => s.replace(/'/g, `'\\''`);
 
-	const args: string[] = [
-		"pi",
-		"--mode", "json",
-		"-p",
-		"--no-extensions",
-		"--model", model,
-		"--tools", tools,
-		"--thinking", "off",
-		"--append-system-prompt", `'${escapeShell(systemPrompt)}'`,
-		"--session", piSessionFile,
-	];
-
-	if (shouldContinue) args.push("-c");
-	if (extraArgs.length) args.push(...extraArgs);
-
-	// Inject the FIFO path as an env var so the child wrapper can open it
-	// PI_IPC_FIFO is read by openChildChannel() in ipc.ts
-	args.push(`'${escapeShell(task)}'`);
-
-	// Wrap in env var injection
-	return `PI_IPC_FIFO='${fifoPath}' ${args.join(" ")}`;
+	return `node '${escapeShell(CHILD_RUNNER_PATH)}' '${escapeShell(encoded)}'`;
 }
 
 // ── AgentRun factory ──────────────────────────────────────────────────────────
@@ -189,6 +194,13 @@ export async function dispatchAgent(
 		// Unknown terminals are handled by the generic launcher — no error here.
 	}
 
+	if (!existsSync(CHILD_RUNNER_PATH)) {
+		throw new Error(
+			`child-runner.js not found at ${CHILD_RUNNER_PATH}. ` +
+			`Ensure the extension package includes this file.`
+		);
+	}
+
 	// 3. Resolve output path
 	const resolvedOutputPath = resolveOutputPath(request, def);
 
@@ -206,9 +218,14 @@ export async function dispatchAgent(
 	const transport = { type: "fifo" as const, path: ipcPath, openTimeoutMs: request.ipc.openTimeoutMs };
 	const channel = await createChannel(transport);
 
-	// 8. Build pi command
+	// 8. Create run record
+	const runId = randomUUID();
+	const run = makeRun(runId, def, request, resolvedOutputPath);
+
+	// 9. Build pi command
 	const model = request.model ?? process.env.PI_MODEL ?? "openrouter/google/gemini-2.5-flash-preview";
 	const command = buildPiCommand({
+		runId,
 		model,
 		tools: def.tools,
 		systemPrompt: def.systemPrompt,
@@ -217,11 +234,8 @@ export async function dispatchAgent(
 		fifoPath: ipcPath,
 		task,
 		extraArgs: request.extraArgs ?? [],
+		cwd,
 	});
-
-	// 9. Create run record
-	const runId = randomUUID();
-	const run = makeRun(runId, def, request, resolvedOutputPath);
 
 	// Elapsed timer
 	const elapsedTimer = setInterval(() => {
@@ -232,6 +246,9 @@ export async function dispatchAgent(
 	// 10. Wire up IPC message handlers
 	const textChunks: string[] = [];
 	let finalUsage: TokenUsage = { inputTokens: 0, outputTokens: 0 };
+	let sawDone = false;
+	let doneExitCode = 1;
+	let terminalErr: string | undefined;
 
 	channel.onMessage((msg: IpcMessage) => {
 		switch (msg.type) {
@@ -259,15 +276,23 @@ export async function dispatchAgent(
 				break;
 
 			case "agent_done":
-				// handled in the promise below
+				sawDone = true;
+				doneExitCode = msg.exitCode;
+				finalUsage = msg.usage;
+				run.usage = msg.usage;
+				if (msg.output) {
+					run.output = msg.output;
+					run.lastWork = lastNonEmptyLine(run.output);
+				}
 				break;
 
 			case "agent_error":
-				// handled in the promise below
+				terminalErr = msg.message;
+				run.status = "failed";
 				break;
 		}
 
-		run.status = "running";
+		if (run.status !== "failed") run.status = "running";
 		onUpdate?.(snapshot(run));
 	});
 
@@ -297,10 +322,7 @@ export async function dispatchAgent(
 			run.endedAt = Date.now();
 			run.elapsed = run.endedAt - run.startedAt;
 
-			// Determine final status from last agent_done / agent_error message
-			// (the FIFO close is the signal the child process has exited)
-			const lastMsg = [...textChunks]; // already accumulated
-			const succeeded = !err && run.status !== "failed";
+			const succeeded = !err && !terminalErr && sawDone && doneExitCode === 0;
 			run.status = succeeded ? "complete" : "failed";
 
 			// Record session metadata
@@ -334,7 +356,11 @@ export async function dispatchAgent(
 			};
 
 			if (err) {
-				reject(err);
+				reject(new Error(terminalErr ? `${terminalErr} (${err.message})` : err.message));
+			} else if (terminalErr) {
+				reject(new Error(terminalErr));
+			} else if (!succeeded) {
+				reject(new Error(`Agent "${def.name}" did not complete successfully`));
 			} else {
 				resolve(result);
 			}

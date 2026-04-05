@@ -16,7 +16,7 @@
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { Text } from "@mariozechner/pi-tui";
 import { join } from "path";
 import { scanAgentDirs, buildAgentIndex } from "../agent-loader.ts";
 import { dispatchAgent } from "../dispatcher.ts";
@@ -32,7 +32,7 @@ const GROUP: AgentGroup = {
 	defaults: {
 		context: "fresh",
 		terminal: { type: "env" },       // reads PI_TERMINAL at dispatch time
-		ipc: { type: "fifo", path: "", openTimeoutMs: 12_000 },
+		ipc: { type: "fifo", openTimeoutMs: 12_000 },
 		output: true,                     // each agent writes to its outputFile
 		inputs: [],
 	},
@@ -75,7 +75,7 @@ export default function (pi: ExtensionAPI) {
 
 					for (const run of runs.values()) {
 						const statusColor =
-							run.status === "idle"     ? "dim"
+							run.status === "queued"   ? "dim"
 							: run.status === "running"  ? "accent"
 							: run.status === "complete" ? "success"
 							: "error";

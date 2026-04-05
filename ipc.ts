@@ -20,7 +20,7 @@
  */
 
 import { open, unlink, constants as fsConstants } from "fs/promises";
-import { createReadStream, existsSync } from "fs";
+import { createReadStream } from "fs";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import { createInterface } from "readline";
@@ -101,27 +101,34 @@ async function createFifoChannel(transport: FifoTransport): Promise<IpcChannel> 
 
 	const messageHandlers: Array<(msg: IpcMessage) => void> = [];
 	const closeHandlers: Array<(err?: Error) => void> = [];
-	let closed = false;
-
-	// ── Open the read end (non-blocking) ──
-	//
-	// Opening a FIFO O_RDONLY blocks until the write-end is opened.
-	// We use O_RDONLY | O_NONBLOCK so open() returns immediately, then we poll
-	// via a readline stream. The stream will only emit data once the child opens
-	// its write-end — which is fine; readline just waits.
-	//
-	// Note: On Linux, O_NONBLOCK on a FIFO affects open() but not subsequent
-	// reads — readline will still block-read correctly once data arrives.
 
 	let fd: Awaited<ReturnType<typeof open>> | null = null;
-
-	// We open lazily inside waitForOpen so that if createChannel() is called
-	// before the FIFO exists on disk (race), the delay is absorbed there.
-
 	let readlineInterface: ReturnType<typeof createInterface> | null = null;
+	let startPromise: Promise<void> | null = null;
 	let openResolve: (() => void) | null = null;
 	let openReject: ((err: Error) => void) | null = null;
 	let openTimer: ReturnType<typeof setTimeout> | null = null;
+	let opened = false;
+	let cleanedUp = false;
+	let closeEmitted = false;
+
+	function resolveOpenIfPending(): void {
+		if (!openResolve) return;
+		if (openTimer) clearTimeout(openTimer);
+		const res = openResolve;
+		openResolve = null;
+		openReject = null;
+		res();
+	}
+
+	function rejectOpenIfPending(err: Error): void {
+		if (!openReject) return;
+		if (openTimer) clearTimeout(openTimer);
+		const rej = openReject;
+		openResolve = null;
+		openReject = null;
+		rej(err);
+	}
 
 	function emitMessage(raw: string): void {
 		if (!raw.trim()) return;
@@ -129,51 +136,56 @@ async function createFifoChannel(transport: FifoTransport): Promise<IpcChannel> 
 		try {
 			msg = JSON.parse(raw) as IpcMessage;
 		} catch {
-			// Malformed line — skip silently
 			return;
+		}
+		if (!opened) {
+			opened = true;
+			resolveOpenIfPending();
 		}
 		for (const h of messageHandlers) h(msg);
 	}
 
 	function emitClose(err?: Error): void {
-		if (closed) return;
-		closed = true;
+		if (closeEmitted) return;
+		closeEmitted = true;
 		for (const h of closeHandlers) h(err);
 	}
 
+	async function cleanup(): Promise<void> {
+		if (cleanedUp) return;
+		cleanedUp = true;
+
+		if (openTimer) clearTimeout(openTimer);
+		try { readlineInterface?.close(); } catch {}
+		try { await fd?.close(); } catch {}
+		try { await unlink(path); } catch {}
+	}
+
 	async function startReading(): Promise<void> {
-		// Open with O_NONBLOCK to avoid blocking if child hasn't connected yet
-		fd = await open(path, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+		if (startPromise) return startPromise;
 
-		const stream = createReadStream("", { fd: fd.fd, autoClose: false });
-		readlineInterface = createInterface({ input: stream, crlfDelay: Infinity });
+		startPromise = (async () => {
+			fd = await open(path, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+			const stream = createReadStream("", { fd: fd.fd, autoClose: false });
+			readlineInterface = createInterface({ input: stream, crlfDelay: Infinity });
 
-		readlineInterface.on("line", (line) => {
-			// First line signals the child has connected — resolve waitForOpen
-			if (openResolve) {
-				if (openTimer) clearTimeout(openTimer);
-				const res = openResolve;
-				openResolve = null;
-				openReject = null;
-				res();
-			}
-			emitMessage(line);
-		});
+			readlineInterface.on("line", emitMessage);
 
-		readlineInterface.on("close", () => {
-			emitClose();
-		});
+			readlineInterface.on("close", () => {
+				cleanup()
+					.then(() => emitClose())
+					.catch((err) => emitClose(err as Error));
+			});
 
-		stream.on("error", (err) => {
-			emitClose(err);
-			if (openReject) {
-				if (openTimer) clearTimeout(openTimer);
-				const rej = openReject;
-				openResolve = null;
-				openReject = null;
-				rej(err);
-			}
-		});
+			stream.on("error", (err) => {
+				rejectOpenIfPending(err as Error);
+				cleanup()
+					.then(() => emitClose(err as Error))
+					.catch((cleanupErr) => emitClose(cleanupErr as Error));
+			});
+		})();
+
+		return startPromise;
 	}
 
 	return {
@@ -188,43 +200,24 @@ async function createFifoChannel(transport: FifoTransport): Promise<IpcChannel> 
 		},
 
 		async waitForOpen(): Promise<void> {
-			// Start reading — this opens the fd and sets up readline
 			await startReading();
+			if (opened) return;
 
 			return new Promise<void>((resolve, reject) => {
-				// If readline already fired before we set up the promise
-				// (extremely unlikely but possible), resolve immediately.
-				if (!openResolve && !closed) {
-					resolve();
-					return;
-				}
-
 				openResolve = resolve;
 				openReject = reject;
-
 				openTimer = setTimeout(() => {
-					openResolve = null;
-					openReject = null;
-					reject(new Error(
+					const timeoutErr = new Error(
 						`IPC FIFO open timeout after ${openTimeoutMs}ms — ` +
 						`child process may have failed to start. Path: ${path}`
-					));
+					);
+					rejectOpenIfPending(timeoutErr);
 				}, openTimeoutMs);
 			});
 		},
 
 		async close(): Promise<void> {
-			if (closed) return;
-			closed = true;
-
-			if (openTimer) clearTimeout(openTimer);
-			readlineInterface?.close();
-
-			try { await fd?.close(); } catch {}
-
-			// Unlink the FIFO — best effort, ignore if already gone
-			try { await unlink(path); } catch {}
-
+			await cleanup();
 			emitClose();
 		},
 	};
