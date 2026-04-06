@@ -16,10 +16,14 @@
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { StringEnum } from "@mariozechner/pi-ai";
+import { Type } from "@sinclair/typebox";
 import { Text } from "@mariozechner/pi-tui";
 import { join } from "path";
 import { scanAgentDirs, buildAgentIndex } from "../agent-loader.ts";
 import { dispatchAgent } from "../dispatcher.ts";
+import { buildDispatchRequest, type DispatchToolInput } from "../dispatch-request-builder.ts";
+import { validateDispatchToolInput } from "../dispatch-validation.ts";
 import { listAgentSessions, latestPiSessionFilePath, readSessionHeader } from "../session.ts";
 import { applyExtensionDefaults } from "../themeMap.ts";
 import type { AgentRun, AgentGroup, DispatchRequest, AgentDef } from "../types.ts";
@@ -43,6 +47,17 @@ const GROUP: AgentGroup = {
 	},
 	gridCols: 2,
 };
+
+const DispatchSubagentParams = Type.Object({
+	agent: Type.String({ minLength: 1, description: "Subagent name (e.g. riddle-maker)" }),
+	task: Type.String({ minLength: 1, description: "Task/instruction for the subagent" }),
+	context: Type.Optional(StringEnum(["fresh", "fork"] as const)),
+	inputs: Type.Optional(Type.Array(Type.String(), { description: "Optional input file paths (relative to cwd)" })),
+	output: Type.Optional(Type.Union([Type.Boolean(), Type.String()])),
+	model: Type.Optional(Type.String()),
+	tools: Type.Optional(Type.String()),
+	thinking: Type.Optional(Type.String()),
+});
 
 // ── Extension ─────────────────────────────────────────────────────────────────
 
@@ -91,8 +106,9 @@ export default function (pi: ExtensionAPI) {
 
 						const id = run.sessionId ?? run.runId;
 						const reason = run.sessionReason ? ` [${run.sessionReason}]` : "";
+						const msgCount = run.messageCount ?? 0;
 						const name  = theme.fg("accent", `${run.def.name} (${shortId(id)})`.padEnd(28));
-						const badge = theme.fg(statusColor, `${icon} ${run.status}${reason}`);
+						const badge = theme.fg(statusColor, `${icon} ${run.status}${reason} (${msgCount} msg)`);
 
 						const row = `  ${name}  ${badge}`;
 						lines.push(row);
@@ -183,6 +199,7 @@ export default function (pi: ExtensionAPI) {
 					toolCount: 0,
 					contextPct: 0,
 					runCount: 1,
+					messageCount: 0,
 					elapsed: 0,
 				});
 				currentKeyByRunId.set(s.id, s.id);
@@ -240,35 +257,37 @@ export default function (pi: ExtensionAPI) {
 		return warnings;
 	}
 
-	async function dispatch(
-		agentName: string,
-		task: string,
-		inputs: string[] = [],
-	): Promise<void> {
+	async function dispatch(input: DispatchToolInput): Promise<void> {
+		const agentName = input.agent;
 		const def = agentIndex.get(agentName.toLowerCase());
 		if (!def) {
 			widgetCtx?.ui.notify(`Agent not found: ${agentName}`, "error");
 			return;
 		}
 
-		const contextMode = GROUP.overrides?.[agentName]?.context ?? GROUP.defaults.context;
-		const request: DispatchRequest = {
-			agent: agentName,
-			task,
-			inputs,
-			output: GROUP.overrides?.[agentName]?.output ?? GROUP.defaults.output,
-			context: contextMode,
-			terminal: GROUP.defaults.terminal,
-			ipc: { type: "fifo", path: "", openTimeoutMs: GROUP.defaults.ipc.openTimeoutMs },
+		const overrideKey = Object.keys(GROUP.overrides ?? {}).find(k => k.toLowerCase() === agentName.toLowerCase());
+		const fallbackContext = overrideKey
+			? (GROUP.overrides?.[overrideKey]?.context ?? GROUP.defaults.context)
+			: GROUP.defaults.context;
+		const errors = validateDispatchToolInput(
+			input,
+			agentIndex,
+			widgetCtx?.sessionManager?.getSessionId?.(),
+			fallbackContext,
+		);
+		if (errors.length) {
+			widgetCtx?.ui.notify(`Invalid dispatch request:\n${errors.join("\n")}`, "error");
+			return;
+		}
+
+		const request: DispatchRequest = buildDispatchRequest({
+			input,
+			group: GROUP,
+			agentDefaultInputs: def.inputs,
 			sessionDir,
 			cwd,
-			model: GROUP.overrides?.[agentName]?.model ?? GROUP.defaults.model,
-			tools: GROUP.overrides?.[agentName]?.tools ?? GROUP.defaults.tools,
-			thinking: GROUP.overrides?.[agentName]?.thinking ?? GROUP.defaults.thinking,
-			forkSessionId: contextMode === "fork"
-				? (GROUP.overrides?.[agentName]?.forkSessionId ?? widgetCtx?.sessionManager?.getSessionId?.())
-				: undefined,
-		};
+			currentSessionId: widgetCtx?.sessionManager?.getSessionId?.(),
+		});
 
 		widgetCtx?.ui.notify(formatLaunchSummary(def, request), "info");
 
@@ -294,6 +313,37 @@ export default function (pi: ExtensionAPI) {
 		updateWidget();
 	}
 
+	pi.registerTool({
+		name: "dispatch_subagent",
+		label: "Dispatch Subagent",
+		description: "Launch a subagent in a separate terminal (fresh or fork from current master session)",
+		parameters: DispatchSubagentParams,
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			widgetCtx = ctx;
+			if (!cwd || !sessionDir) {
+				return {
+					content: [{ type: "text", text: "riddle-team is not initialized yet. Wait for session_start." }],
+				};
+			}
+
+			const input: DispatchToolInput = {
+				agent: params.agent,
+				task: params.task,
+				context: params.context,
+				inputs: params.inputs,
+				output: params.output,
+				model: params.model,
+				tools: params.tools,
+				thinking: params.thinking,
+			};
+
+			void dispatch(input);
+			return {
+				content: [{ type: "text", text: `Dispatched ${input.agent} (${input.context ?? "fresh"})` }],
+			};
+		},
+	});
+
 	// ── Commands ──────────────────────────────────────────────────────────────
 
 	pi.registerCommand("riddle-make", {
@@ -306,7 +356,10 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			// Fire and forget — master does not await or display the output
-			dispatch("riddle-maker", `Create a riddle about: ${topic}`).catch(() => {});
+			dispatch({
+				agent: "riddle-maker",
+				task: `Create a riddle about: ${topic}`,
+			}).catch(() => {});
 		},
 	});
 
@@ -332,11 +385,11 @@ export default function (pi: ExtensionAPI) {
 				? `Additional instruction: ${args.trim()}`
 				: "";
 
-			dispatch(
-				"riddle-solver",
-				["Solve the riddle in the input file.", extraTask].filter(Boolean).join("\n"),
-				[makerOutputFile],
-			).catch(() => {});
+			dispatch({
+				agent: "riddle-solver",
+				task: ["Solve the riddle in the input file.", extraTask].filter(Boolean).join("\n"),
+				inputs: [makerOutputFile],
+			}).catch(() => {});
 		},
 	});
 
@@ -352,7 +405,8 @@ export default function (pi: ExtensionAPI) {
 			const lines = [...runs.values()].map(r => {
 				const id = r.sessionId ?? r.runId;
 				const reason = r.sessionReason ? ` [${r.sessionReason}]` : "";
-				return `${r.def.name} (${shortId(id)}): ${r.status}${reason}`;
+				const msgCount = r.messageCount ?? 0;
+				return `${r.def.name} (${shortId(id)}): ${r.status}${reason} (${msgCount} msg)`;
 			});
 
 			ctx.ui.notify(lines.join("\n"), "info");
@@ -422,8 +476,8 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(`Restored ${restoredCount} prior subagent run(s) from session files.`, "info");
 		}
 
-		// Master has no tools — it only dispatches via commands
-		pi.setActiveTools([]);
+		// Master exposes only the dispatch tool
+		pi.setActiveTools(["dispatch_subagent"]);
 
 		ctx.ui.setStatus("riddle-team", "idle");
 		ctx.ui.notify(

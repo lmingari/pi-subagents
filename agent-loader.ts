@@ -6,6 +6,7 @@
  *   name        required — unique agent identifier
  *   description optional — one-line summary
  *   tools       optional — comma-separated pi tool names
+ *   inputs      optional — comma-separated default input file paths
  *   thinking    optional — default thinking level
  *   model       optional — default model id for this agent
  *   output      optional — default output file path, relative to cwd
@@ -55,6 +56,15 @@ function normalizeOptionalValue(value: string | undefined): string | undefined {
 	return normalized || undefined;
 }
 
+function normalizeInputs(value: string | undefined): string[] | undefined {
+	if (!value) return undefined;
+	const normalized = normalizeFrontmatterValue(value)
+		.split(",")
+		.map(v => v.trim())
+		.filter(Boolean);
+	return normalized.length ? normalized : undefined;
+}
+
 // ── Frontmatter parser ────────────────────────────────────────────────────────
 
 /**
@@ -92,6 +102,7 @@ export function parseAgentFile(filePath: string): AgentDef | null {
 		name: frontmatter.name,
 		description: frontmatter.description ?? "",
 		tools: normalizeTools(frontmatter.tools),
+		inputs: normalizeInputs(frontmatter.inputs),
 		thinking: normalizeOptionalValue(frontmatter.thinking),
 		model: normalizeOptionalValue(frontmatter.model),
 		systemPrompt: body.trim(),

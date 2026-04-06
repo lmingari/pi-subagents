@@ -30,6 +30,7 @@ export interface TokenUsage {
  *   name: code-reviewer
  *   description: Reviews code for bugs and style issues
  *   tools: read,grep,find,ls
+ *   inputs: outputs/plan.md,src/auth.ts
  *   thinking: medium
  *   model: openrouter/google/gemini-2.5-flash-preview
  *   output: outputs/code-reviewer.md   # relative to cwd, optional
@@ -47,6 +48,8 @@ export interface AgentDef {
 	description: string;
 	/** Optional comma-separated pi tool names this agent is allowed to use */
 	tools?: string;
+	/** Optional default input files (relative to cwd), comma-separated in frontmatter */
+	inputs?: InputFiles;
 	/** Optional default thinking level for this agent */
 	thinking?: string;
 	/** Optional default model for this agent (overridden by DispatchRequest.model) */
@@ -158,6 +161,7 @@ export type IpcMessage =
 	| { type: "context_update"; runId: string; usedTokens: number; contextWindow: number }
 	| { type: "token_usage";    runId: string; usage: TokenUsage }
 	| { type: "session_update"; runId: string; sessionId?: string; sessionFile?: string; timestamp?: string; reason?: string }
+	| { type: "reply_update";   runId: string; text: string }
 	| { type: "agent_done";     runId: string; exitCode: number; output: string; usage: TokenUsage }
 	| { type: "agent_error";    runId: string; message: string };
 
@@ -252,6 +256,8 @@ export interface AgentRun {
 	/** Elapsed ms, updated every second while running */
 	elapsed: number;
 	usage?: TokenUsage;
+	/** Number of assistant messages received from child */
+	messageCount?: number;
 	/** Active pi session UUID reported by child extension events */
 	sessionId?: string;
 	/** Active pi session file reported by child extension events */

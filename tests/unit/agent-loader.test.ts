@@ -32,6 +32,7 @@ test("parseAgentFile supports provider/modelID convention and quoted values", ()
 	assert.ok(def);
 	assert.equal(def.model, "openrouter/anthropic/claude-3.7-sonnet");
 	assert.equal(def.tools, "read,grep,find");
+	assert.deepEqual(def.inputs, ["outputs/plan.md", "src/main.ts"]);
 	assert.equal(def.thinking, "medium");
 	assert.equal(def.outputFile, "outputs/research.md");
 });

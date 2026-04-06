@@ -168,6 +168,7 @@ function makeRun(
 		toolCount: 0,
 		contextPct: 0,
 		runCount: 0,
+		messageCount: 0,
 		elapsed: 0,
 	};
 }
@@ -328,6 +329,21 @@ export async function dispatchAgent(
 				if (msg.sessionId) run.sessionId = msg.sessionId;
 				if (msg.sessionFile) run.sessionFile = msg.sessionFile;
 				if (msg.reason) run.sessionReason = msg.reason;
+				break;
+
+			case "reply_update":
+				run.output = msg.text;
+				run.lastWork = lastNonEmptyLine(run.output);
+				run.messageCount = (run.messageCount ?? 0) + 1;
+				if (resolvedOutputPath && run.output) {
+					try {
+						const outDir = dirname(resolvedOutputPath);
+						if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true });
+						writeFileSync(resolvedOutputPath, run.output, "utf-8");
+					} catch (writeErr) {
+						console.warn(`[dispatcher] Could not write output file "${resolvedOutputPath}": ${(writeErr as Error).message}`);
+					}
+				}
 				break;
 
 			case "agent_done":

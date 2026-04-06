@@ -26,6 +26,21 @@ function emitSessionUpdate(ctx, event) {
 	});
 }
 
+function extractAssistantText(message) {
+	if (!message || message.role !== "assistant") return "";
+	const content = message.content;
+	if (!Array.isArray(content)) return "";
+	const text = content
+		.map((block) => {
+			if (!block || typeof block !== "object") return "";
+			if (block.type === "text" && typeof block.text === "string") return block.text;
+			return "";
+		})
+		.join("")
+		.trim();
+	return text;
+}
+
 export default function (pi) {
 	pi.on("session_start", async (event, ctx) => {
 		emitSessionUpdate(ctx, event);
@@ -35,5 +50,17 @@ export default function (pi) {
 	// is the canonical post-switch event.
 	pi.on("session_switch", async (event, ctx) => {
 		emitSessionUpdate(ctx, event);
+	});
+
+	pi.on("message_end", async (event) => {
+		const runId = process.env.PI_SUBAGENT_RUN_ID;
+		if (!runId) return;
+		const text = extractAssistantText(event?.message);
+		if (!text) return;
+		sendIpc({
+			type: "reply_update",
+			runId,
+			text,
+		});
 	});
 }
