@@ -5,7 +5,7 @@
  *   1. Resolve the AgentDef from the agent index
  *   2. Read input files and prepend their contents to the task string
  *   3. Resolve the output file path (string | true | false → string | null)
- *   4. Resolve session (fresh vs fork → pi --session + optional -c)
+ *   4. Resolve session mode (fresh or explicit fork via --fork <sessionId>)
  *   5. Create the FIFO and IPC channel
  *   6. Build the pi CLI command string
  *   7. Launch the terminal via terminal.ts
@@ -34,6 +34,7 @@ import { requireAgent } from "./agent-loader.ts";
 export type AgentIndex = Map<string, AgentDef>;
 
 const CHILD_RUNNER_PATH = fileURLToPath(new URL("./child-runner.js", import.meta.url));
+const SUBAGENT_BRIDGE_PATH = fileURLToPath(new URL("./subagent-session-bridge.js", import.meta.url));
 
 function debugEnabled(): boolean {
 	const v = process.env.PI_SUBAGENT_DEBUG?.trim().toLowerCase();
@@ -107,10 +108,11 @@ function buildTask(request: DispatchRequest): string {
 function buildPiCommand(options: {
 	runId: string;
 	model?: string;
-	tools: string;
+	tools?: string;
+	thinking?: string;
 	systemPrompt: string;
-	piSessionFile: string;
-	shouldContinue: boolean;
+	piSessionDir: string;
+	forkSessionId?: string;
 	fifoPath: string;
 	task: string;
 	extraArgs: string[];
@@ -118,8 +120,8 @@ function buildPiCommand(options: {
 }): string {
 	const {
 		runId,
-		model, tools, systemPrompt, piSessionFile,
-		shouldContinue, fifoPath, task, extraArgs, cwd,
+		model, tools, thinking, systemPrompt, piSessionDir,
+		forkSessionId, fifoPath, task, extraArgs, cwd,
 	} = options;
 
 	const payload = {
@@ -128,13 +130,15 @@ function buildPiCommand(options: {
 		cwd,
 		piArgs: [
 			"--no-extensions",
+			"-e", SUBAGENT_BRIDGE_PATH,
 			...(model ? ["--model", model] : []),
-			"--tools", tools,
-			"--thinking", "off",
-			"--append-system-prompt", `${systemPrompt}\n\nInitial task from master: ${task}`,
-			"--session", piSessionFile,
-			...(shouldContinue ? ["-c"] : []),
+			...(tools ? ["--tools", tools] : []),
+			...(thinking ? ["--thinking", thinking] : []),
+			"--append-system-prompt", systemPrompt,
+			"--session-dir", piSessionDir,
+			...(forkSessionId ? ["--fork", forkSessionId] : []),
 			...extraArgs,
+			task,
 		],
 	};
 
@@ -207,6 +211,12 @@ export async function dispatchAgent(
 			`Ensure the extension package includes this file.`
 		);
 	}
+	if (!existsSync(SUBAGENT_BRIDGE_PATH)) {
+		throw new Error(
+			`subagent-session-bridge.js not found at ${SUBAGENT_BRIDGE_PATH}. ` +
+			`Ensure the extension package includes this file.`
+		);
+	}
 
 	// 3. Resolve output path
 	const resolvedOutputPath = resolveOutputPath(request, def);
@@ -214,31 +224,41 @@ export async function dispatchAgent(
 	// 4. Build the task string with injected input file contents
 	const task = buildTask(request);
 
-	// 5. Resolve session (fresh vs fork)
-	const { piSessionFile, shouldContinue } = resolveSession(sessionDir, def.name, context);
+	// 5. Resolve per-agent session directory
+	const { piSessionDir, latestSessionFile } = resolveSession(sessionDir, def.name);
+
+	// Context mode:
+	//   fresh -> no fork flags
+	//   fork  -> explicit --fork <sessionId>
+	const forkSessionId = context === "fork" ? request.forkSessionId?.trim() : undefined;
+	if (context === "fork" && !forkSessionId) {
+		throw new Error(`Dispatch for agent "${def.name}" uses context:"fork" but no forkSessionId was provided.`);
+	}
 
 	// 6. Ensure session dir exists
 	if (!existsSync(sessionDir)) mkdirSync(sessionDir, { recursive: true });
 
-	// 7. Create FIFO and IPC channel
-	const ipcPath = fifoPath(sessionDir, def.name);
-	const transport = { type: "fifo" as const, path: ipcPath, openTimeoutMs: request.ipc.openTimeoutMs };
-	const channel = await createChannel(transport);
-
-	// 8. Create run record
+	// 7. Create run record
 	const runId = randomUUID();
 	const run = makeRun(runId, def, request, resolvedOutputPath);
 
+	// 8. Create FIFO and IPC channel (one FIFO per process/run)
+	const ipcPath = fifoPath(sessionDir, def.name, runId);
+	const transport = { type: "fifo" as const, path: ipcPath, openTimeoutMs: request.ipc.openTimeoutMs };
+	const channel = await createChannel(transport);
+
 	// 9. Build pi command
 	const model = request.model ?? def.model;
-	const tools = def.tools?.trim() || "read,grep,find,ls";
+	const tools = request.tools?.trim() || def.tools?.trim() || undefined;
+	const thinking = request.thinking?.trim() || def.thinking?.trim() || undefined;
 	const command = buildPiCommand({
 		runId,
 		model,
 		tools,
+		thinking,
 		systemPrompt: def.systemPrompt,
-		piSessionFile,
-		shouldContinue,
+		piSessionDir,
+		forkSessionId,
 		fifoPath: ipcPath,
 		task,
 		extraArgs: request.extraArgs ?? [],
@@ -250,11 +270,14 @@ export async function dispatchAgent(
 		cwd,
 		sessionDir,
 		ipcPath,
-		piSessionFile,
-		shouldContinue,
+		piSessionDir,
+		latestSessionFile,
+		forkSessionId: forkSessionId ?? "(none)",
 		model: model ?? "(pi default)",
-		tools,
+		tools: tools ?? "(pi default)",
+		thinking: thinking ?? "(pi default)",
 		childRunner: CHILD_RUNNER_PATH,
+		subagentBridge: SUBAGENT_BRIDGE_PATH,
 		commandPreview: command.slice(0, 500),
 	});
 
@@ -272,6 +295,10 @@ export async function dispatchAgent(
 	let terminalErr: string | undefined;
 
 	channel.onMessage((msg: IpcMessage) => {
+		if ((msg as { runId?: string }).runId !== runId) {
+			debugLog("ipc message ignored (runId mismatch)", { expected: runId, got: (msg as { runId?: string }).runId, type: msg.type });
+			return;
+		}
 		debugLog("ipc message", { runId, type: msg.type });
 		switch (msg.type) {
 			case "text_delta":
@@ -295,6 +322,12 @@ export async function dispatchAgent(
 			case "token_usage":
 				finalUsage = msg.usage;
 				run.usage = msg.usage;
+				break;
+
+			case "session_update":
+				if (msg.sessionId) run.sessionId = msg.sessionId;
+				if (msg.sessionFile) run.sessionFile = msg.sessionFile;
+				if (msg.reason) run.sessionReason = msg.reason;
 				break;
 
 			case "agent_done":

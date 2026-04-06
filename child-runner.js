@@ -195,7 +195,11 @@ send({ type: "context_update", runId, usedTokens: 0, contextWindow: 1 });
 
 const child = spawn("pi", piArgs, {
 	cwd,
-	env: { ...process.env, PI_IPC_FIFO: fifoPath },
+	env: {
+		...process.env,
+		PI_IPC_FIFO: fifoPath,
+		PI_SUBAGENT_RUN_ID: runId,
+	},
 	stdio: "inherit",
 });
 log("pi spawn attempted", { command: "pi", args: piArgs, cwd, mode: "interactive" });

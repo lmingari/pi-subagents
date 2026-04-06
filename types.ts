@@ -30,6 +30,7 @@ export interface TokenUsage {
  *   name: code-reviewer
  *   description: Reviews code for bugs and style issues
  *   tools: read,grep,find,ls
+ *   thinking: medium
  *   model: openrouter/google/gemini-2.5-flash-preview
  *   output: outputs/code-reviewer.md   # relative to cwd, optional
  *   ---
@@ -44,8 +45,10 @@ export interface AgentDef {
 	name: string;
 	/** One-line description shown in dashboards and system prompts */
 	description: string;
-	/** Comma-separated pi tool names this agent is allowed to use */
-	tools: string;
+	/** Optional comma-separated pi tool names this agent is allowed to use */
+	tools?: string;
+	/** Optional default thinking level for this agent */
+	thinking?: string;
 	/** Optional default model for this agent (overridden by DispatchRequest.model) */
 	model?: string;
 	/** Full system prompt body (everything after the frontmatter block) */
@@ -63,10 +66,8 @@ export interface AgentDef {
 // ── Dispatch context ──────────────────────────────────────────────────────────
 
 /**
- * fresh — agent starts with a clean session (no -c flag passed to pi).
- * fork  — agent resumes its own prior session (-c flag passed).
- *         "Own" means: only this agent's previous runs, never the master's history.
- *         If no prior session exists, behaves like fresh.
+ * fresh — start in the per-agent session directory without forking.
+ * fork  — launch with --fork <sessionId> (source session provided in DispatchRequest.forkSessionId).
  */
 export type DispatchContext = "fresh" | "fork";
 
@@ -126,12 +127,11 @@ export type TerminalTarget =
 // ── IPC — FIFO (child → parent only) ─────────────────────────────────────────
 
 /**
- * One FIFO per agent: <sessionDir>/<agentName>.fifo
+ * One FIFO per run: <sessionDir>/<agentName>-<runId>.fifo
  *
  * Lifecycle:
  *   1. Parent creates the FIFO (mkfifo) before launching the terminal.
- *   2. Parent opens O_RDONLY|O_NONBLOCK, polls until child connects or
- *      openTimeoutMs elapses (prevents indefinite block on open()).
+ *   2. Parent opens the FIFO and waits until child connects or openTimeoutMs elapses.
  *   3. Child opens O_WRONLY, writes newline-delimited JSON (IpcMessage).
  *   4. Parent reads until agent_done / agent_error, then unlinks the FIFO.
  *
@@ -143,7 +143,7 @@ export type IpcTransport = FifoTransport;
 
 export interface FifoTransport {
 	type: "fifo";
-	/** Absolute path: <sessionDir>/<agentName>.fifo — filled in by dispatcher */
+	/** Absolute path: <sessionDir>/<agentName>-<runId>.fifo — filled in by dispatcher */
 	path: string;
 	/** Max ms to wait for child to open the write-end. Default: 10_000 */
 	openTimeoutMs?: number;
@@ -157,6 +157,7 @@ export type IpcMessage =
 	| { type: "tool_end";       runId: string; toolName: string; durationMs: number }
 	| { type: "context_update"; runId: string; usedTokens: number; contextWindow: number }
 	| { type: "token_usage";    runId: string; usage: TokenUsage }
+	| { type: "session_update"; runId: string; sessionId?: string; sessionFile?: string; timestamp?: string; reason?: string }
 	| { type: "agent_done";     runId: string; exitCode: number; output: string; usage: TokenUsage }
 	| { type: "agent_error";    runId: string; message: string };
 
@@ -198,7 +199,7 @@ export interface DispatchRequest {
 	/** Terminal mode — normally { type: "env" } */
 	terminal: TerminalTarget;
 	/**
-	 * IPC descriptor. The dispatcher sets path = <sessionDir>/<agentName>.fifo
+	 * IPC descriptor. The dispatcher sets path = <sessionDir>/<agentName>-<runId>.fifo
 	 * before spawning. Callers can leave path empty.
 	 */
 	ipc: IpcTransport;
@@ -208,6 +209,12 @@ export interface DispatchRequest {
 	cwd: string;
 	/** Override the model for this specific dispatch */
 	model?: string;
+	/** Override tools for this specific dispatch */
+	tools?: string;
+	/** Override thinking level for this specific dispatch */
+	thinking?: string;
+	/** For context:"fork", source session UUID to fork from */
+	forkSessionId?: string;
 	/** Extra pi CLI flags forwarded verbatim */
 	extraArgs?: string[];
 }
@@ -245,6 +252,12 @@ export interface AgentRun {
 	/** Elapsed ms, updated every second while running */
 	elapsed: number;
 	usage?: TokenUsage;
+	/** Active pi session UUID reported by child extension events */
+	sessionId?: string;
+	/** Active pi session file reported by child extension events */
+	sessionFile?: string;
+	/** Last session event reason from child (startup/new/resume/fork/reload/...) */
+	sessionReason?: string;
 	/** PID of the spawned terminal process */
 	pid?: number;
 }
@@ -302,6 +315,8 @@ export interface AgentGroup {
 		output: OutputTarget;
 		inputs: InputFiles;
 		model?: string;
+		tools?: string;
+		thinking?: string;
 	};
 	/**
 	 * Per-agent overrides (key = agent name, case-insensitive).
@@ -314,6 +329,8 @@ export interface AgentGroup {
 		inputs: InputFiles;
 		model: string;
 		tools: string;
+		thinking: string;
+		forkSessionId: string;
 		openTimeoutMs: number;
 	}>>;
 	/** Dashboard grid columns (auto-computed from member count if omitted) */
@@ -323,13 +340,15 @@ export interface AgentGroup {
 // ── Session persistence ───────────────────────────────────────────────────────
 
 /**
- * Written to <sessionDir>/sessions/<agentName>.json.
- * Lets the dispatcher know a prior session file exists → pass -c to pi.
- * Each agent tracks only its own session — never the master's.
+ * Written to <sessionDir>/<agentName>/meta.json.
+ * Session transcript files live next to it as:
+ *   <sessionDir>/<agentName>/<timestamp>_<uuid>.jsonl
+ *
+ * Tracks per-agent recent session metadata for status and resume visibility.
  */
 export interface AgentSession {
 	agentName: string;
-	/** Absolute path to the pi session .json file */
+	/** Absolute path to the active/recent pi session .jsonl file */
 	sessionFile: string;
 	createdAt: number;
 	lastUsedAt: number;

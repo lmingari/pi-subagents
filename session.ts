@@ -1,47 +1,130 @@
 /**
  * session.ts — AgentSession persistence.
  *
- * Tracks whether a prior pi session file exists for each agent so the
- * dispatcher knows whether to pass -c (continue) to pi.
+ * Session layout (per agent):
+ *   <sessionDir>/<agentName>/meta.json
+ *   <sessionDir>/<agentName>/<timestamp>_<uuid>.jsonl
  *
- * Session records live at: <sessionDir>/sessions/<agentName>.json
- * Pi session files live at: <sessionDir>/sessions/<agentName>.pi.json
- *
- * The distinction:
- *   *.json      — our AgentSession metadata (runCount, usage totals, etc.)
- *   *.pi.json   — the raw pi session file passed to pi via --session
+ * Pi owns session file creation/IDs. We only select per-agent session dirs and
+ * inspect latest files for resume metadata.
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "fs";
 import { join } from "path";
-import type { AgentSession, DispatchContext, TokenUsage } from "./types.ts";
+import { SessionManager } from "@mariozechner/pi-coding-agent";
+import type { AgentSession, TokenUsage } from "./types.ts";
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
-
-export function sessionsDir(sessionDir: string): string {
-	return join(sessionDir, "sessions");
-}
-
-export function sessionMetaPath(sessionDir: string, agentName: string): string {
-	const safe = safeName(agentName);
-	return join(sessionsDir(sessionDir), `${safe}.json`);
-}
-
-export function piSessionFilePath(sessionDir: string, agentName: string): string {
-	const safe = safeName(agentName);
-	return join(sessionsDir(sessionDir), `${safe}.pi.json`);
-}
 
 function safeName(name: string): string {
 	return name.toLowerCase().replace(/[^a-z0-9-]/g, "-");
 }
 
-// ── Read / write ──────────────────────────────────────────────────────────────
+export function agentSessionDir(sessionDir: string, agentName: string): string {
+	return join(sessionDir, safeName(agentName));
+}
+
+export function sessionMetaPath(sessionDir: string, agentName: string): string {
+	return join(agentSessionDir(sessionDir, agentName), "meta.json");
+}
+
+export function listPiSessionFiles(
+	sessionDir: string,
+	agentName: string,
+): string[] {
+	const dir = agentSessionDir(sessionDir, agentName);
+	if (!existsSync(dir)) return [];
+
+	try {
+		return readdirSync(dir)
+			.filter(f => f.endsWith(".jsonl"))
+			.sort()
+			.map(f => join(dir, f));
+	} catch {
+		return [];
+	}
+}
+
+export function latestPiSessionFilePath(
+	sessionDir: string,
+	agentName: string,
+): string | null {
+	const files = listPiSessionFiles(sessionDir, agentName);
+	if (!files.length) return null;
+	return files[files.length - 1];
+}
+
+export interface SessionHeaderSummary {
+	id: string;
+	timestamp: string;
+	cwd?: string;
+}
+
+export interface ListedSession {
+	path: string;
+	id: string;
+	timestamp: string;
+	cwd?: string;
+}
+
+export function readSessionHeader(path: string): SessionHeaderSummary | null {
+	if (!existsSync(path)) return null;
+	try {
+		const firstLine = readFileSync(path, "utf-8").split(/\r?\n/, 1)[0];
+		const header = JSON.parse(firstLine);
+		if (header?.type !== "session") return null;
+		if (typeof header.id !== "string" || typeof header.timestamp !== "string") return null;
+		return { id: header.id, timestamp: header.timestamp, cwd: header.cwd };
+	} catch {
+		return null;
+	}
+}
 
 /**
- * Load an existing AgentSession from disk.
- * Returns null if no session has been recorded yet for this agent.
+ * List sessions for one agent using Pi SessionManager metadata when available.
+ * Falls back to direct jsonl scan if listing fails.
  */
+export async function listAgentSessions(
+	cwd: string,
+	sessionDir: string,
+	agentName: string,
+): Promise<ListedSession[]> {
+	const dir = agentSessionDir(sessionDir, agentName);
+	if (!existsSync(dir)) return [];
+
+	try {
+		const infos = await SessionManager.list(cwd, dir);
+		const items: ListedSession[] = infos
+			.map(info => {
+				const header = readSessionHeader(info.path);
+				if (!header) return null;
+				return {
+					path: info.path,
+					id: header.id,
+					timestamp: header.timestamp,
+					cwd: header.cwd,
+				} satisfies ListedSession;
+			})
+			.filter((v): v is ListedSession => Boolean(v));
+
+		items.sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
+		return items;
+	} catch {
+		const files = listPiSessionFiles(sessionDir, agentName);
+		const items = files
+			.map(path => {
+				const header = readSessionHeader(path);
+				if (!header) return null;
+				return { path, id: header.id, timestamp: header.timestamp, cwd: header.cwd };
+			})
+			.filter((v): v is ListedSession => Boolean(v));
+		items.sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
+		return items;
+	}
+}
+
+// ── Read / write ──────────────────────────────────────────────────────────────
+
 export function loadSession(
 	sessionDir: string,
 	agentName: string,
@@ -55,12 +138,8 @@ export function loadSession(
 	}
 }
 
-/**
- * Persist an AgentSession to disk.
- * Creates the sessions directory if it doesn't exist.
- */
 export function saveSession(sessionDir: string, session: AgentSession): void {
-	const dir = sessionsDir(sessionDir);
+	const dir = agentSessionDir(sessionDir, session.agentName);
 	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 	writeFileSync(
 		sessionMetaPath(sessionDir, session.agentName),
@@ -69,22 +148,20 @@ export function saveSession(sessionDir: string, session: AgentSession): void {
 	);
 }
 
-/**
- * Update an existing session after a run completes, or create a new one.
- * Accumulates token usage across runs.
- */
 export function recordRun(
 	sessionDir: string,
 	agentName: string,
 	usage: TokenUsage,
 ): void {
 	const existing = loadSession(sessionDir, agentName);
-	const piFile = piSessionFilePath(sessionDir, agentName);
+	const resolvedSessionFile = latestPiSessionFilePath(sessionDir, agentName);
+	if (!resolvedSessionFile) return;
 	const now = Date.now();
 
 	if (existing) {
 		saveSession(sessionDir, {
 			...existing,
+			sessionFile: resolvedSessionFile,
 			lastUsedAt: now,
 			runCount: existing.runCount + 1,
 			totalUsage: addUsage(existing.totalUsage, usage),
@@ -92,7 +169,7 @@ export function recordRun(
 	} else {
 		saveSession(sessionDir, {
 			agentName,
-			sessionFile: piFile,
+			sessionFile: resolvedSessionFile,
 			createdAt: now,
 			lastUsedAt: now,
 			runCount: 1,
@@ -101,42 +178,26 @@ export function recordRun(
 	}
 }
 
-// ── Fresh vs fork resolution ──────────────────────────────────────────────────
+// ── Session directory resolution ──────────────────────────────────────────────
 
 export interface SessionResolution {
-	/**
-	 * Absolute path to the pi session file to pass via --session.
-	 * Always set — pi will create it on first run if it doesn't exist.
-	 */
-	piSessionFile: string;
-	/**
-	 * Whether to pass -c (continue) to pi.
-	 * True only when context is "fork" AND a prior pi session file exists on disk.
-	 */
-	shouldContinue: boolean;
+	/** Per-agent directory passed to pi via --session-dir */
+	piSessionDir: string;
+	/** Most recent existing session file in that directory, if any */
+	latestSessionFile: string | null;
 }
 
-/**
- * Resolve session handling for a dispatch.
- *
- *   fresh → shouldContinue: false (always start clean)
- *   fork  → shouldContinue: true only if the pi session file exists on disk
- *            (if no prior session exists, behaves like fresh silently)
- */
 export function resolveSession(
 	sessionDir: string,
 	agentName: string,
-	context: DispatchContext,
 ): SessionResolution {
-	const piSessionFile = piSessionFilePath(sessionDir, agentName);
+	const dir = agentSessionDir(sessionDir, agentName);
+	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
-	if (context === "fresh") {
-		return { piSessionFile, shouldContinue: false };
-	}
-
-	// fork — only continue if the pi session file actually exists
-	const shouldContinue = existsSync(piSessionFile);
-	return { piSessionFile, shouldContinue };
+	return {
+		piSessionDir: dir,
+		latestSessionFile: latestPiSessionFilePath(sessionDir, agentName),
+	};
 }
 
 // ── Utility ───────────────────────────────────────────────────────────────────

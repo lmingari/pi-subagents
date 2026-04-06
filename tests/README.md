@@ -20,18 +20,23 @@ Implemented:
   - empty tools fallback
   - provider/modelID parsing (`provider/modelID` convention)
   - directory scan precedence
+- `tests/unit/session-files.test.ts`
+  - validates session filename `<timestamp>_<uuid>.jsonl` against JSONL header
 
 Run with Node + tsx loader:
 
 ```bash
-node --import tsx --test tests/unit/agent-loader.test.ts
+node --import tsx --test tests/unit/agent-loader.test.ts tests/unit/session-files.test.ts
 ```
 
 Or without installing globally:
 
 ```bash
-npx -y tsx --test tests/unit/agent-loader.test.ts
+npx -y tsx --test tests/unit/agent-loader.test.ts tests/unit/session-files.test.ts
 ```
+
+If your environment cannot import `@mariozechner/pi-coding-agent` in tests,
+install it as a local dev dependency in this project so Node/tsx can resolve package exports consistently.
 
 ## Manual smoke test
 

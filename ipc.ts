@@ -2,7 +2,7 @@
  * ipc.ts — IPC channel management for pi subagents.
  *
  * Current transport: FIFO (named pipe), child → parent only.
- * One FIFO per agent, path: <sessionDir>/<agentName>.fifo
+ * One FIFO per run, path: <sessionDir>/<agentName>-<runId>.fifo
  *
  * Extending: implement IpcChannel and register it in createChannel().
  * Callers only ever deal with IpcChannel — the transport is an impl detail.
@@ -83,12 +83,13 @@ export async function createChannel(transport: IpcTransport): Promise<IpcChannel
 }
 
 /**
- * Compute the canonical FIFO path for an agent within a session directory.
+ * Compute a per-process FIFO path for an agent within a session directory.
  * Called by the dispatcher to fill in FifoTransport.path before spawning.
  */
-export function fifoPath(sessionDir: string, agentName: string): string {
-	const safe = agentName.toLowerCase().replace(/[^a-z0-9-]/g, "-");
-	return `${sessionDir}/${safe}.fifo`;
+export function fifoPath(sessionDir: string, agentName: string, runId: string): string {
+	const safeAgent = agentName.toLowerCase().replace(/[^a-z0-9-]/g, "-");
+	const safeRun = runId.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 12);
+	return `${sessionDir}/${safeAgent}-${safeRun}.fifo`;
 }
 
 // ── FIFO implementation ───────────────────────────────────────────────────────

@@ -2,6 +2,7 @@
 name: researcher
 description: "Finds sources and synthesizes findings"
 tools: "read, grep, find"
+thinking: medium
 model: openrouter/anthropic/claude-3.7-sonnet
 output: outputs/research.md
 ---

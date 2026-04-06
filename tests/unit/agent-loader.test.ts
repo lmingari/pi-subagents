@@ -21,10 +21,10 @@ test("parseAgentFile parses standard frontmatter fields", () => {
 	assert.match(def.systemPrompt, /creative riddle maker/i);
 });
 
-test("parseAgentFile defaults empty tools to built-in defaults", () => {
+test("parseAgentFile keeps tools undefined when omitted/empty", () => {
 	const def = parseAgentFile(fixture("riddle-solver.md"));
 	assert.ok(def);
-	assert.equal(def.tools, "read,grep,find,ls");
+	assert.equal(def.tools, undefined);
 });
 
 test("parseAgentFile supports provider/modelID convention and quoted values", () => {
@@ -32,6 +32,7 @@ test("parseAgentFile supports provider/modelID convention and quoted values", ()
 	assert.ok(def);
 	assert.equal(def.model, "openrouter/anthropic/claude-3.7-sonnet");
 	assert.equal(def.tools, "read,grep,find");
+	assert.equal(def.thinking, "medium");
 	assert.equal(def.outputFile, "outputs/research.md");
 });
 

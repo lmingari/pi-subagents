@@ -5,7 +5,8 @@
  * Recognised frontmatter fields:
  *   name        required — unique agent identifier
  *   description optional — one-line summary
- *   tools       optional — comma-separated pi tool names (default: "read,grep,find,ls")
+ *   tools       optional — comma-separated pi tool names
+ *   thinking    optional — default thinking level
  *   model       optional — default model id for this agent
  *   output      optional — default output file path, relative to cwd
  *
@@ -27,7 +28,6 @@ const AGENT_DIRS = [
 	".pi/agents",
 ] as const;
 
-const DEFAULT_TOOLS = "read,grep,find,ls";
 
 function normalizeFrontmatterValue(value: string): string {
 	const trimmed = value.trim();
@@ -39,14 +39,20 @@ function normalizeFrontmatterValue(value: string): string {
 	return unquoted.trim();
 }
 
-function normalizeTools(value: string | undefined): string {
-	if (!value) return DEFAULT_TOOLS;
+function normalizeTools(value: string | undefined): string | undefined {
+	if (!value) return undefined;
 	const normalized = normalizeFrontmatterValue(value)
 		.split(",")
 		.map(t => t.trim())
 		.filter(Boolean)
 		.join(",");
-	return normalized || DEFAULT_TOOLS;
+	return normalized || undefined;
+}
+
+function normalizeOptionalValue(value: string | undefined): string | undefined {
+	if (!value) return undefined;
+	const normalized = normalizeFrontmatterValue(value);
+	return normalized || undefined;
 }
 
 // ── Frontmatter parser ────────────────────────────────────────────────────────
@@ -86,7 +92,8 @@ export function parseAgentFile(filePath: string): AgentDef | null {
 		name: frontmatter.name,
 		description: frontmatter.description ?? "",
 		tools: normalizeTools(frontmatter.tools),
-		model: frontmatter.model || undefined,
+		thinking: normalizeOptionalValue(frontmatter.thinking),
+		model: normalizeOptionalValue(frontmatter.model),
 		systemPrompt: body.trim(),
 		file: filePath,
 		outputFile: frontmatter.output || undefined,

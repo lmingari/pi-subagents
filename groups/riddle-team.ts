@@ -5,7 +5,7 @@
  *   PI_TERMINAL=iterm pi -e extensions/groups/riddle-team.ts
  *
  * Each agent runs in its own terminal window. The master shows a compact
- * status panel (name / status / elapsed) but never echoes API replies —
+ * status panel (name / runId / status) but never echoes API replies —
  * those are visible only in each agent's own terminal and written to their
  * output files under outputs/.
  *
@@ -20,6 +20,7 @@ import { Text } from "@mariozechner/pi-tui";
 import { join } from "path";
 import { scanAgentDirs, buildAgentIndex } from "../agent-loader.ts";
 import { dispatchAgent } from "../dispatcher.ts";
+import { listAgentSessions, latestPiSessionFilePath, readSessionHeader } from "../session.ts";
 import { applyExtensionDefaults } from "../themeMap.ts";
 import type { AgentRun, AgentGroup, DispatchRequest, AgentDef } from "../types.ts";
 
@@ -46,8 +47,10 @@ const GROUP: AgentGroup = {
 // ── Extension ─────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-	// Live run state — one entry per agent, keyed by agent name
+	// Live run state shown in widget, keyed by display identity (sessionId or runId)
 	const runs = new Map<string, AgentRun>();
+	// Current display key for each process runId.
+	const currentKeyByRunId = new Map<string, string>();
 	let widgetCtx: any;
 	let sessionDir = "";
 	let cwd = "";
@@ -55,7 +58,7 @@ export default function (pi: ExtensionAPI) {
 
 	// ── Status widget ─────────────────────────────────────────────────────────
 	//
-	// Shows name | status | elapsed for each agent.
+	// Shows agent (runId) | status for each run.
 	// Never displays API output — that stays in each agent's own terminal.
 
 	function updateWidget(): void {
@@ -67,7 +70,7 @@ export default function (pi: ExtensionAPI) {
 			return {
 				render(width: number): string[] {
 					if (runs.size === 0) {
-						text.setText(theme.fg("dim", "No agents dispatched yet."));
+						text.setText(theme.fg("dim", ""));
 						return text.render(width);
 					}
 
@@ -86,12 +89,10 @@ export default function (pi: ExtensionAPI) {
 							: run.status === "complete" ? "✓"
 							: "✗";
 
-						const elapsedStr = run.elapsed > 0
-							? ` ${Math.round(run.elapsed / 1_000)}s`
-							: "";
-
-						const name  = theme.fg("accent", run.def.name.padEnd(16));
-						const badge = theme.fg(statusColor, `${icon} ${run.status}${elapsedStr}`);
+						const id = run.sessionId ?? run.runId;
+						const reason = run.sessionReason ? ` [${run.sessionReason}]` : "";
+						const name  = theme.fg("accent", `${run.def.name} (${shortId(id)})`.padEnd(28));
+						const badge = theme.fg(statusColor, `${icon} ${run.status}${reason}`);
 
 						const row = `  ${name}  ${badge}`;
 						lines.push(row);
@@ -111,12 +112,94 @@ export default function (pi: ExtensionAPI) {
 		return tools.split(",").map(t => t.trim()).filter(Boolean);
 	}
 
+	function shortId(id: string): string {
+		return id.slice(0, 8);
+	}
+
+	function latestRunForAgent(agentName: string): AgentRun | undefined {
+		const candidates = [...runs.values()].filter(r => r.def.name === agentName);
+		if (!candidates.length) return undefined;
+		candidates.sort((a, b) => b.startedAt - a.startedAt);
+		return candidates[0];
+	}
+
+	function upsertRunForDisplay(nextRun: AgentRun): void {
+		const prevKey = currentKeyByRunId.get(nextRun.runId);
+		const nextKey = nextRun.sessionId ?? nextRun.runId;
+
+		if (prevKey && prevKey !== nextKey) {
+			const prev = runs.get(prevKey);
+			const wasRealSession = Boolean(prev?.sessionId && prev.sessionId === prevKey);
+			if (prev && wasRealSession) {
+				runs.set(prevKey, {
+					...prev,
+					status: "complete",
+					endedAt: prev.endedAt ?? Date.now(),
+					lastWork: `session switched to ${shortId(nextKey)}`,
+				});
+			} else if (prevKey) {
+				runs.delete(prevKey);
+			}
+		}
+
+		runs.set(nextKey, nextRun);
+		currentKeyByRunId.set(nextRun.runId, nextKey);
+	}
+
+	async function seedRunsFromExistingSessions(): Promise<number> {
+		let restored = 0;
+		for (const member of GROUP.members) {
+			const def = agentIndex.get(member.toLowerCase());
+			if (!def) continue;
+			const sessions = await listAgentSessions(cwd, sessionDir, member);
+			for (const s of sessions) {
+				if (runs.has(s.id)) continue;
+
+				const ts = Date.parse(s.timestamp || "") || Date.now();
+				const request: DispatchRequest = {
+					agent: def.name,
+					task: "[restored from existing session]",
+					inputs: [],
+					output: GROUP.overrides?.[def.name]?.output ?? GROUP.defaults.output,
+					context: GROUP.overrides?.[def.name]?.context ?? GROUP.defaults.context,
+					terminal: GROUP.defaults.terminal,
+					ipc: { type: "fifo", path: "", openTimeoutMs: GROUP.defaults.ipc.openTimeoutMs },
+					sessionDir,
+					cwd,
+				};
+
+				runs.set(s.id, {
+					runId: s.id,
+					sessionId: s.id,
+					sessionFile: s.path,
+					def,
+					request,
+					resolvedOutputPath: null,
+					status: "complete",
+					startedAt: ts,
+					endedAt: ts,
+					output: "",
+					lastWork: `restored from ${s.path.split("/").pop()}`,
+					toolCount: 0,
+					contextPct: 0,
+					runCount: 1,
+					elapsed: 0,
+				});
+				currentKeyByRunId.set(s.id, s.id);
+				restored += 1;
+			}
+		}
+		return restored;
+	}
+
 	function formatLaunchSummary(def: AgentDef, request: DispatchRequest): string {
 		const model = request.model ?? def.model ?? "(pi default)";
 		const provider = typeof model === "string" && model.includes("/")
 			? model.split("/")[0]
 			: "(default provider)";
-		const tools = splitTools(def.tools || "");
+		const toolsValue = request.tools ?? def.tools;
+		const tools = splitTools(toolsValue || "");
+		const thinking = request.thinking ?? def.thinking ?? "(pi default)";
 		const description = def.description?.trim() || "(no description)";
 		const output = typeof request.output === "string"
 			? request.output
@@ -126,8 +209,9 @@ export default function (pi: ExtensionAPI) {
 		return [
 			`Launching ${def.name}`,
 			`provider/model: ${provider} / ${model}`,
-			`tools: ${tools.length ? tools.join(", ") : "(none)"}`,
-			`context: ${request.context}`,
+			`tools: ${tools.length ? tools.join(", ") : "(pi default)"}`,
+			`thinking: ${thinking}`,
+			`context: ${request.context}${request.forkSessionId ? ` (${request.forkSessionId.slice(0, 8)})` : ""}`,
 			`output: ${output}`,
 			`description: ${description}`,
 		].join("\n");
@@ -137,7 +221,7 @@ export default function (pi: ExtensionAPI) {
 		const warnings: string[] = [];
 		const tools = splitTools(def.tools || "");
 		if (!tools.length) {
-			warnings.push(`${def.name}: no tools configured; default tools will be used`);
+			warnings.push(`${def.name}: no tools configured in agent file (pi default will be used)`);
 		}
 
 		if (!def.systemPrompt?.trim()) {
@@ -167,16 +251,23 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		const contextMode = GROUP.overrides?.[agentName]?.context ?? GROUP.defaults.context;
 		const request: DispatchRequest = {
 			agent: agentName,
 			task,
 			inputs,
 			output: GROUP.overrides?.[agentName]?.output ?? GROUP.defaults.output,
-			context: GROUP.overrides?.[agentName]?.context ?? GROUP.defaults.context,
+			context: contextMode,
 			terminal: GROUP.defaults.terminal,
 			ipc: { type: "fifo", path: "", openTimeoutMs: GROUP.defaults.ipc.openTimeoutMs },
 			sessionDir,
 			cwd,
+			model: GROUP.overrides?.[agentName]?.model ?? GROUP.defaults.model,
+			tools: GROUP.overrides?.[agentName]?.tools ?? GROUP.defaults.tools,
+			thinking: GROUP.overrides?.[agentName]?.thinking ?? GROUP.defaults.thinking,
+			forkSessionId: contextMode === "fork"
+				? (GROUP.overrides?.[agentName]?.forkSessionId ?? widgetCtx?.sessionManager?.getSessionId?.())
+				: undefined,
 		};
 
 		widgetCtx?.ui.notify(formatLaunchSummary(def, request), "info");
@@ -185,7 +276,7 @@ export default function (pi: ExtensionAPI) {
 			// dispatchAgent streams updates via onUpdate — we use them only to
 			// refresh the status widget, never to display API content in master.
 			await dispatchAgent(request, agentIndex, (run) => {
-				runs.set(agentName, run);
+				upsertRunForDisplay(run);
 				updateWidget();
 				// Update status bar
 				const alive = [...runs.values()].filter(r => r.status === "running").length;
@@ -224,7 +315,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			widgetCtx = ctx;
 
-			const makerRun = runs.get("riddle-maker");
+			const makerRun = latestRunForAgent("riddle-maker");
 			if (!makerRun || makerRun.status !== "complete") {
 				ctx.ui.notify(
 					"riddle-maker has not completed yet. Run /riddle-make <topic> first.",
@@ -259,8 +350,9 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const lines = [...runs.values()].map(r => {
-				const elapsed = r.elapsed > 0 ? ` (${Math.round(r.elapsed / 1_000)}s)` : "";
-				return `${r.def.name}: ${r.status}${elapsed}`;
+				const id = r.sessionId ?? r.runId;
+				const reason = r.sessionReason ? ` [${r.sessionReason}]` : "";
+				return `${r.def.name} (${shortId(id)}): ${r.status}${reason}`;
 			});
 
 			ctx.ui.notify(lines.join("\n"), "info");
@@ -299,8 +391,9 @@ export default function (pi: ExtensionAPI) {
 			const model = def.model ?? "(pi default)";
 			const provider = model.includes("/") ? model.split("/")[0] : "(default provider)";
 			const tools = splitTools(def.tools || "");
+			const thinking = def.thinking ?? "(pi default)";
 			startupSummary.push(
-				`${def.name} → ${provider}/${model} | tools: ${tools.length ? tools.join(",") : "(default)"}`
+				`${def.name} → ${provider}/${model} | tools: ${tools.length ? tools.join(",") : "(pi default)"} | thinking: ${thinking}`
 			);
 		}
 
@@ -309,6 +402,24 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (startupSummary.length) {
 			ctx.ui.notify(`Agent summary:\n${startupSummary.join("\n")}`, "info");
+		}
+
+		// Resume discovery: show latest known session IDs/files per agent
+		const resumeLines: string[] = [];
+		for (const member of GROUP.members) {
+			const latest = latestPiSessionFilePath(sessionDir, member);
+			if (!latest) continue;
+			const header = readSessionHeader(latest);
+			const id = header?.id ? header.id.slice(0, 8) : "unknown";
+			resumeLines.push(`${member} -> ${id} (${latest.split("/").pop()})`);
+		}
+		if (resumeLines.length) {
+			ctx.ui.notify(`Resume sessions found:\n${resumeLines.join("\n")}`, "info");
+		}
+
+		const restoredCount = await seedRunsFromExistingSessions();
+		if (restoredCount > 0) {
+			ctx.ui.notify(`Restored ${restoredCount} prior subagent run(s) from session files.`, "info");
 		}
 
 		// Master has no tools — it only dispatches via commands
